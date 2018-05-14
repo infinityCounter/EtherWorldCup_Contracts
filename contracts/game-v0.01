@@ -1,0 +1,274 @@
+pragma solidity ^0.4.4;
+
+import "../node_modules/zeppelin-solidity/contracts/ownership/Ownable.sol";
+import "../installed_contracts/oraclize-api/contracts/usingOraclize.sol";
+
+// DON'T ASSOCIATE PROFILES WITH BETS OR LALALA
+// PUSH OPERATIONS COST TOO MUCH, IT WOULD BE CHEAPER TO HAVE A DATABASE
+// AND JUST QUERY FROM THAT INSTEAD OF PUSHING FOR CONVENIENCE
+
+contract MatchPortal is Ownable {
+
+    struct Match {
+        string name;
+        string teamA;
+        string teamB;
+        uint   start;
+        uint   status; // 0 - not set, 1 - not started, 2 - in play, 3 - over
+        uint   winner; // 0 - not set, 1 - teamA, 2 - teamB, 3- Draw, 4 - no winner
+    }
+
+    struct Bet {
+        address better;
+        uint    amount;
+        uint    option; // 0 - not set, 1 - teamA, 2 - teamB, 3 - Draw
+        uint    matchId;
+        bool    cancelled; // 0 - no, 1 - yes
+    }
+
+    struct OptionBettingPool {
+        uint option;
+        uint totalAmountBet;
+        uint[] betIds;
+    }
+
+    struct MatchBettingPool {
+        uint matchId;
+        bool lock; // Locked when payed out
+        OptionBettingPool teamAPool;
+        OptionBettingPool teamBPool;
+        OptionBettingPool drawPool;
+    }
+
+    struct BetterProfile {
+        address better;
+        uint    totalBet;
+        uint    totalWon;
+        uint[]  betIds;
+    }
+
+    uint public constant COMMISSION_RATE = 7;
+    // need to address if this could be used to drain contract of eth
+    // by cancelling bets and it costs more to return the money than the amount of money
+    uint public CANCEL_FEE = 10;
+    uint public MINIMUM_BET = 0.01 ether;
+    uint public constant MAX_NUM_PAYOUT_ATTEMPTS = 6; // the number of payout attempts can be increased to 6 at most
+    uint public NUM_PAYOUT_ATTEMPTS = 4; // after 4 attemps a refund will be given
+    uint public constant PAYOUT_ATTEMPT_INTERVAL = 3 hours; // try every 3 hours to release payout
+    uint public constant BETTING_CLOSE_DELAY = 5 minutes;
+    uint public constant MATCH_ENDING_QUERY_DELAY = 15 minutes;
+
+    uint public totalBetAmount = 0;
+    uint private commissions = 0;
+
+    Match[] matches;
+    Bet[]   bets;
+
+    Bet[]   topBetters;
+    Bet[]   topWinners;
+    
+    mapping(string => uint) matchIds;
+    mapping(uint => MatchBettingPool) matchPools;
+    mapping(address => BetterProfile) profiles;
+
+    modifier validGame(uint _matchId) {
+        require(_matchId < matches.length);
+        _;
+    }
+
+    function addGame(string _name, string _teamA, string _teamB, uint _start) public onlyOwner returns (bool, uint) {
+        // Check if the match already exists
+        if (matches.length > 0) {
+            uint matchId = matchIds[_name];
+            if (matches[matchId].start != 0) {
+                return (false, matchId);
+            } 
+        }
+        // Check that there's at least 15 minutes until the match starts
+        if ((_start + 15 minutes) <= now) {
+            return (false, 0);
+        }
+        Match memory newMatch = Match(_name, _teamA, _teamB, _start, 0, 0);
+        matchId = matches.push(newMatch);
+        return (true, matchId);
+    }
+
+    function getNumGames() public view returns (uint) {
+        return matches.length;
+    }
+
+    function getGame(uint _matchId) public view validGame(_matchId) returns (string, string, string, uint, uint, uint, uint, uint, uint) {
+        Match memory game = matches[_matchId];
+        MatchBettingPool memory pool = matchPools[_matchId];
+        return (game.name, game.teamA, game.teamB, game.start, game.status, 
+            game.winner, pool.teamAPool.totalAmountBet, pool.teamBPool.totalAmountBet, pool.drawPool.totalAmountBet);
+    }
+
+    function getProfile(address better) public view returns (address, uint, uint, uint) {
+        BetterProfile memory profile = profiles[better];
+        return (better, profile.totalBet, profile.totalWon, profile.betIds.length);
+    }
+
+    function getProfileBet(address better, uint betId) public view returns (address, uint, uint, uint, bool) {
+        BetterProfile memory profile = profiles[better];
+        if (profile.betIds.length < betId) {
+            Bet memory bet = bets[profile.betIds[betId]];
+            return (bet.better, bet.amount, bet.option, bet.matchId, bet.cancelled);
+        }
+        return (address(0), 0, 0, 0, false);
+    }
+
+    function getBet(uint _betId) public view returns (address, uint, uint, uint, bool) {
+        if (bets.length <= _betId) {
+            return (address(0), 0, 0, 0, false);
+        }
+        Bet memory bet = bets[_betId];
+        return (bet.better, bet.amount, bet.option, bet.matchId, bet.cancelled);
+    } 
+
+    function placeBet(uint _matchId, uint _outcome) public payable validGame(_matchId) returns (bool, uint) {
+        Match memory game = matches[_matchId];
+        if (now >= (game.start - BETTING_CLOSE_DELAY) 
+            || _outcome < 1 
+            || _outcome > 3 
+            || msg.value < MINIMUM_BET) {
+            return (false, 0);
+        }
+        Bet memory bet = Bet(msg.sender, msg.value, _outcome, _matchId, false);
+        uint betId = bets.push(bet);
+        MatchBettingPool storage pool = matchPools[_matchId];
+        if (_outcome == 1) {
+            pool.teamAPool.betIds.push(betId);
+            pool.teamAPool.totalAmountBet += msg.value;
+        } else if (_outcome == 2) {
+            pool.teamBPool.betIds.push(betId);
+            pool.teamBPool.totalAmountBet += msg.value;
+        } else {
+            pool.drawPool.betIds.push(betId);
+            pool.drawPool.totalAmountBet += msg.value;
+        }
+        BetterProfile storage profile = profiles[msg.sender];
+        profile.totalBet += msg.value;
+        profile.betIds.push(betId);
+        return (true, betId);
+    }
+
+    function cancelBet(uint _betId) public returns (string, bool) {
+        if (_betId >= bets.length) {
+            return ("Invalid bet Id", false);
+        }
+        Bet storage bet = bets[_betId];
+        if (bet.cancelled) {
+            return ("Bet already cancelled", false);
+        }
+        Match memory game = matches[bet.matchId];
+        if (now >= (game.start - BETTING_CLOSE_DELAY)) {
+            return ("Unable to cancel bet, betting already locked", false);
+        }
+        uint commission = bet.amount / 100 * CANCEL_FEE;
+        commissions += commission;
+        bet.better.transfer(bet.amount - commission);
+        bet.cancelled = true;
+        BetterProfile storage profile = profiles[bet.better];
+        profile.totalBet -= bet.amount;
+        return ("Bet successfully cancelled", true);
+    }
+
+    function _payoutWinners(uint _matchId, uint _outcome) private validGame(_matchId) returns (bool) {
+        MatchBettingPool memory matchPool = matchPools[_matchId];
+            // If the match didn't happen, return all the monies
+        if (_outcome == 4) {
+            for (uint count = 0; count < matchPool.teamAPool.betIds.length; count++) {
+                Bet memory bet = bets[matchPool.teamAPool.betIds[count]];
+                if (!bet.cancelled) {
+                    bet.better.transfer(bet.amount);
+                }
+            }
+            for (count = 0; count < matchPool.teamBPool.betIds.length; count++) {
+                bet = bets[matchPool.teamBPool.betIds[count]];
+                if (!bet.cancelled) {
+                    bet.better.transfer(bet.amount);
+                }
+            }
+            for (count = 0; count < matchPool.drawPool.betIds.length; count++) {
+                bet = bets[matchPool.drawPool.betIds[count]];
+                if (!bet.cancelled) {
+                    bet.better.transfer(bet.amount);
+                }
+            }
+        } else {
+            OptionBettingPool memory winningPool;
+            OptionBettingPool memory losingPoolA;
+            OptionBettingPool memory losingPoolB;
+            if (_outcome == 1) {
+                // payout pool A with total amount bet by pool b and the draw pool - comission fee
+                winningPool = matchPools[_matchId].teamAPool;
+                losingPoolA = matchPools[_matchId].teamBPool;
+                losingPoolB = matchPools[_matchId].drawPool;
+            } else if (_outcome == 2) {
+                winningPool = matchPools[_matchId].teamBPool;
+                losingPoolA = matchPools[_matchId].teamAPool;
+                losingPoolB = matchPools[_matchId].drawPool;
+            } else if (_outcome == 3) {
+                winningPool = matchPools[_matchId].drawPool;
+                losingPoolA = matchPools[_matchId].teamAPool;
+                losingPoolB = matchPools[_matchId].teamBPool;
+            } else {
+                return (false);
+            }
+            uint totalLoss = losingPoolA.totalAmountBet + losingPoolB.totalAmountBet;
+            uint commission = totalLoss/100 * COMMISSION_RATE;
+            commissions += commission;
+            uint payoutAmount = (totalLoss - commission); 
+            for (count = 0; count < winningPool.betIds.length; count++) {
+                bet = bets[winningPool.betIds[count]];
+                if (bet.cancelled) {
+                    continue;
+                }
+                uint amountWon = payoutAmount * bet.amount / winningPool.totalAmountBet;
+                bet.better.transfer(amountWon);
+                BetterProfile storage profile = profiles[bet.better];
+                profile.totalWon += amountWon;
+            }
+        }
+        matchPool.lock = true;
+        matchPools[_matchId] = matchPool;
+        Match storage game = matches[_matchId];
+        game.status = 3;
+        game.winner = _outcome;
+        return (true);
+    }
+
+    function getCommissions() public view onlyOwner returns (uint) {
+        return (commissions);
+    }
+
+    function withdrawCommissions() public onlyOwner returns (uint, bool) {
+        owner.transfer(commissions);
+        return (commissions, true);
+    }
+
+    function getBalance() public view returns (uint) {
+        return address(this).balance;
+    }
+
+    // function withdrawBalance() public onlyOwner returns (uint, bool) {
+    //     if (now >)
+    // }
+
+    function getMinimumBet() public view returns (uint) {
+        return MINIMUM_BET;
+    }
+
+    function changeMiniumBet(uint newMin) public onlyOwner {
+        MINIMUM_BET = newMin;
+    }
+
+    // function __callback(bytes32 myid, string result) public {
+    //     if (msg.sender != oraclize_cbAddress()) revert();
+        
+
+    // }
+
+    function() public payable {}
+}
