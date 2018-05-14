@@ -110,7 +110,7 @@ contract WorldCupBroker is Ownable, usingOraclize {
     uint public CANCEL_FEE = 10;
     uint public MINIMUM_BET = 0.01 ether;
     uint public MAX_NUM_PAYOUT_ATTEMPTS = 4; // after 4 attemps a refund will be given
-    /*
+    //*
     uint public constant WITHDRAW_BALANCE_TIMESTAMP = 1531742400;
     uint public constant PAYOUT_ATTEMPT_INTERVAL = 30 minutes; // try every 15 minutes to release payout
     uint public constant BETTING_CLOSE_DELAY = 3 minutes;
