@@ -11,7 +11,7 @@ module.exports = {
       network_id: 3,
       gas: 4700036,
       gasPrice: 20000000000, // Match any network id
-      from: "0xdfffc978720962e2770bc7ea5c1d304b99862e20"
+      from: process.env.LOCAL_GANACHE_ADDRESS
     },
     rinkeby: {
       provider: function() {
