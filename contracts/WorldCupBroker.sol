@@ -4,8 +4,6 @@ import "./Ownable.sol";
 import "./usingOraclize.sol";
 import "./strings.sol";
 
-// YO GO THROUGH AND CHECK OVERFLOWS AND ADDS AND DIVIDES AND PERCENTAGES AND THAT STUFF
-
 contract WorldCupBroker is Ownable, usingOraclize {
 
     using strings for *;
