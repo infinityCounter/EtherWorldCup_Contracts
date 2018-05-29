@@ -29,31 +29,19 @@ contract WorldCupBroker is Ownable, usingOraclize {
         uint   totalDrawBets;
         uint   numBets;
         string fixtureId;
+        string secondaryFixtureId;
+        bool   inverted;
         string name;
         mapping(uint => Bet) bets;
     }
 
-    event MatchCreated(
-        uint8 matchId
-    );
+    event MatchCreated(uint8);
 
-    event MatchCancelled(
-        uint8 matchId
-    );
+    event MatchUpdated(uint8);
 
-    event MatchOver(
-        uint8 matchId, 
-        uint8 result
-    );
+    event MatchFailedAttemptedPayoutRelease(uint8);
 
-    event MatchFailedAttemptedPayoutRelease(
-        uint8 matchId,
-        uint8 numAttempts
-    );
-
-    event MatchFailedPayoutRelease(
-        uint8 matchId
-    );
+    event MatchFailedPayoutRelease(uint8);
 
     event BetPlaced(
         uint8   matchId,
@@ -68,9 +56,7 @@ contract WorldCupBroker is Ownable, usingOraclize {
         uint    betId
     );
     
-    uint8 public constant NUM_TEAMS = 32;
-
-    string[NUM_TEAMS] public TEAMS = [
+    string[32] public TEAMS = [
         "Russia", 
         "Saudi Arabia", 
         "Egypt", 
@@ -104,30 +90,22 @@ contract WorldCupBroker is Ownable, usingOraclize {
         "Colombia", 
         "Japan"
     ];
-    uint public constant COMMISSION_RATE = 7;
-    // need to address if this could be used to drain contract of eth
-    // by cancelling bets and it costs more to return the money than the amount of money
-    uint public CANCEL_FEE = 10;
-    uint public MINIMUM_BET = 0.01 ether;
-    uint public MAX_NUM_PAYOUT_ATTEMPTS = 4; // after 4 attemps a refund will be given
+    uint public constant MAX_NUM_PAYOUT_ATTEMPTS = 4; // after 4 attemps a refund will be given
     //*
-    uint public constant WITHDRAW_BALANCE_TIMESTAMP = 1531742400;
-    uint public constant PAYOUT_ATTEMPT_INTERVAL = 30 minutes; // try every 15 minutes to release payout
-    uint public constant BETTING_CLOSE_DELAY = 3 minutes;
-    uint public constant MATCH_ENDING_QUERY_DELAY = 3 hours;
-    uint public constant MATCH_ADD_TIME_REQUIREMENT = 15 minutes;
+    uint public constant PAYOUT_ATTEMPT_INTERVAL = 10 minutes; // try every 15 minutes to release payout
     /*/
-    uint public constant WITHDRAW_BALANCE_TIMESTAMP = 1526083200;
     uint public constant PAYOUT_ATTEMPT_INTERVAL = 2 minutes; // try every 2 minutes to release payout
-    uint public constant BETTING_CLOSE_DELAY = 3 minutes;
-    uint public constant MATCH_ENDING_QUERY_DELAY = 5 minutes;
-    uint public constant MATCH_ADD_TIME_REQUIREMENT = 1 minutes;
     //*/
+    uint public  commission_rate = 7;
+    uint public  minimum_bet = 0.01 ether;
     uint private commissions = 0;
+    
 
     Match[] matches;
     mapping(bytes32 => uint8) oraclizeIds;
     mapping(uint8 => uint8) payoutAttempts;
+    mapping(uint8 => bool) firstStepVerified;
+    mapping(uint8 => uint8) pendingWinner;
 
     modifier validMatch(uint8 _matchId) {
         require(_matchId < uint8(matches.length), "Invalid Match");
@@ -141,19 +119,21 @@ contract WorldCupBroker is Ownable, usingOraclize {
         _;
     }   
 
-    function addMatch(string _name, uint _fixtureId, uint8 _teamA, uint8 _teamB, uint _start) public onlyOwner returns (uint8) {
+    function addMatch(string _name, string _fixture, string _secondary, bool _invert, uint8 _teamA, uint8 _teamB, uint _start) public onlyOwner returns (uint8) {
         // Check that there's at least 15 minutes until the match starts
-        require(_teamA < NUM_TEAMS && _teamB < NUM_TEAMS && _teamA != _teamB, "Team A and B Id must be less than 32 and greater than 0, and cannot be the same");
-        require((_start - MATCH_ADD_TIME_REQUIREMENT) >= now, "Game cannot be added with less than 15 minutes left to start time");
+        require(_teamA < 32 && _teamB < 32 && _teamA != _teamB, "Team A and B Id must be less than 32 and greater than 0, and cannot be the same");
+        require((_start - 15 minutes) >= now, "Game cannot be added with less than 15 minutes left to start time");
         Match memory newMatch = Match({
             locked: false, 
             cancelled: false, 
             teamA: _teamA,
             teamB: _teamB, 
-            fixtureId: uint2str(_fixtureId),
-            winner: 0, 
+            winner: 0,
+            fixtureId: _fixture,
+            secondaryFixtureId: _secondary,
+            inverted: _invert,
             start: _start, 
-            closeBettingTime: _start - BETTING_CLOSE_DELAY, 
+            closeBettingTime: _start - 3 minutes, 
             totalTeamABets: 0, 
             totalTeamBBets: 0, 
             totalDrawBets: 0, 
@@ -168,21 +148,18 @@ contract WorldCupBroker is Ownable, usingOraclize {
             "json(https://api.football-data.org/v1/fixtures/", 
             newMatch.fixtureId,
             ").fixture.result.[goalsHomeTeam,goalsAwayTeam]");
-        bytes32 oraclizeId = oraclize_query(_start + MATCH_ENDING_QUERY_DELAY, "URL", url);
+        bytes32 oraclizeId = oraclize_query((_start + (3 hours)), "URL", url);
         oraclizeIds[oraclizeId] = matchId;
         emit MatchCreated(matchId);
         return matchId;
     }
 
-    function getNumMatches() public view returns (uint8) {
-        return uint8(matches.length);
-    }
-
-    function getMatch(uint8 _matchId) public view validMatch(_matchId) returns (string, string, uint8, uint8, uint8, uint, bool, bool) {
+    function getMatch(uint8 _matchId) public view validMatch(_matchId) returns (string, string, string, uint8, uint8, uint8, uint, bool, bool) {
         Match memory mtch = matches[_matchId];
         return (
             mtch.name,
             mtch.fixtureId, 
+            mtch.secondaryFixtureId,
             mtch.teamA, 
             mtch.teamB,
             mtch.winner, 
@@ -206,11 +183,10 @@ contract WorldCupBroker is Ownable, usingOraclize {
 
     function cancelMatch(uint8 _matchId) public onlyOwner validMatch(_matchId) returns (bool) {
         Match storage mtch = matches[_matchId];
-        require(!mtch.cancelled, "Match is already cancelled");
-        require(now < mtch.closeBettingTime, "Cannot cancel match after betting has been closed");
-        _returnAllBets(mtch);
+        require(!mtch.cancelled && now < mtch.closeBettingTime);
         mtch.cancelled = true;
-        emit MatchCancelled(_matchId);
+        _returnAllBets(_matchId);
+        emit MatchUpdated(_matchId);
         return true;
     }
 
@@ -224,11 +200,9 @@ contract WorldCupBroker is Ownable, usingOraclize {
         Match storage mtch = matches[_matchId];
         require(
             now < mtch.closeBettingTime &&
-            !mtch.locked &&
-            !mtch.cancelled &&
             _outcome > 0 && 
             _outcome < 4 && 
-            msg.value >= MINIMUM_BET,
+            msg.value >= minimum_bet,
             "Attempt to place invalid bet. Either invalid outcome or value of bet too small, or betting is already closed."
         );
         Bet memory bet = Bet(false, msg.value, _outcome, msg.sender);
@@ -237,10 +211,13 @@ contract WorldCupBroker is Ownable, usingOraclize {
         mtch.numBets++;
         if (_outcome == 1) {
             mtch.totalTeamABets += msg.value;
+            assert(mtch.totalTeamABets >= msg.value);
         } else if (_outcome == 2) {
             mtch.totalTeamBBets += msg.value;
+            assert(mtch.totalTeamBBets >= msg.value);
         } else {
             mtch.totalDrawBets += msg.value;
+            assert(mtch.totalDrawBets >= msg.value);
         }
         emit BetPlaced(_matchId, _outcome, betId, msg.value, msg.sender);
         return (betId);
@@ -253,10 +230,11 @@ contract WorldCupBroker is Ownable, usingOraclize {
         Bet storage bet = matches[_matchId].bets[_betId];
         // only the person who made this bet can cancel it
         require(!bet.cancelled && bet.better == msg.sender, "Only the address that placed a bet may cancel it");
-        uint commission = bet.amount / 100 * CANCEL_FEE;
+        uint commission = bet.amount / 100 * commission_rate;
         // stop re-entry just in case of malicious attack to withdraw all contract eth
         bet.cancelled = true;
         commissions += commission;
+        assert(commissions >= commission);
         if (bet.option == 1) {
             matches[_matchId].totalTeamABets -= bet.amount;
         } else if (bet.option == 2) {
@@ -268,17 +246,6 @@ contract WorldCupBroker is Ownable, usingOraclize {
         emit BetCancelled(_matchId, _betId);
     }
 
-    function _returnAllBets(Match storage _mtch) internal {
-        require(!_mtch.locked, "Match already payed out, cannot return bets");
-        _mtch.locked = true;
-        for(uint count = 0; count < _mtch.numBets; count++) {
-            Bet memory bet = _mtch.bets[count];
-            if (!bet.cancelled) {
-                bet.better.transfer(bet.amount);
-            }    
-        }
-    }
-
     function _returnAllBets(uint8 _matchId) internal {
         Match storage mtch = matches[_matchId];
         require(!mtch.locked, "Match already payed out, cannot return bets");
@@ -286,6 +253,13 @@ contract WorldCupBroker is Ownable, usingOraclize {
         for(uint count = 0; count < mtch.numBets; count++) {
             Bet memory bet = mtch.bets[count];
             if (!bet.cancelled) {
+                if (bet.option == 1) {
+                    mtch.totalTeamABets -= bet.amount;
+                } else if (bet.option == 2) {
+                    mtch.totalTeamBBets -= bet.amount;
+                } else {
+                    mtch.totalDrawBets -= bet.amount;
+                }
                 bet.better.transfer(bet.amount);
             }    
         }
@@ -300,54 +274,49 @@ contract WorldCupBroker is Ownable, usingOraclize {
         uint winPool;
         if (_outcome == 1) {
             totalPool = mtch.totalTeamBBets + mtch.totalDrawBets;
+            assert(totalPool >= mtch.totalTeamBBets);
             winPool = mtch.totalTeamABets;
         } else if (_outcome == 2) {
             totalPool = mtch.totalTeamABets + mtch.totalDrawBets;
+            assert(totalPool >= mtch.totalTeamABets);
             winPool = mtch.totalTeamBBets;
         } else {
             totalPool = mtch.totalTeamABets + mtch.totalTeamBBets;
+            assert(totalPool >= mtch.totalTeamABets);
             winPool = mtch.totalDrawBets;
         }
         for (uint count = 0; count < mtch.numBets; count++) {
             Bet memory bet = mtch.bets[count];
-            if (bet.option != _outcome) {
+            if (bet.option != _outcome || bet.cancelled) {
                 continue;
             }
-            // check this logic that it isn't truncating numbers
             uint winnings = totalPool * bet.amount / winPool;
-            uint commission = winnings / 100 * COMMISSION_RATE;
+            uint commission = winnings / 100 * commission_rate;
             commissions += commission;
+            assert(commissions >= commission);
             winnings -= commission;
             // return original bet amount + (winnings - % commission)
             bet.better.transfer(winnings + bet.amount);
         }
     }
 
-    function getCommissions() public view onlyOwner returns (uint) {
-        return commissions;
+    function changeFees(uint8 _newCommission) public onlyOwner {
+        // Max commission is 7%, but it can be FREE!!
+        require(_newCommission <= 7);
+        commission_rate = _newCommission;
     }
 
     function withdrawCommissions(uint _amount) public onlyOwner {
-        require(_amount < commissions);
+        require(_amount <= commissions);
         commissions -= _amount;
         owner.transfer(_amount);
-    }
-
-    function withdrawCommissions() public onlyOwner {
-        uint amount = commissions;
-        commissions = 0;
-        owner.transfer(amount);
-    }
-
-    function getBalance() public view returns (uint) {
-        return address(this).balance;
     }
 
     function withdrawBalance() public onlyOwner {
         // World cup is over for a full day now so check if there are any matches that have yet to be
         // payed out for (should never happen)
         // return those bets
-        require(now >= WITHDRAW_BALANCE_TIMESTAMP);
+        require(now >= 1531742400);
         for (uint8 count = 0; count < matches.length; count++) {
             if (!matches[count].locked) {
                 _returnAllBets(count);
@@ -359,41 +328,49 @@ contract WorldCupBroker is Ownable, usingOraclize {
         commissions = 0;
     }
 
-    function getMinimumBet() public view returns (uint) {
-        return MINIMUM_BET;
-    }
-
     function changeMiniumBet(uint newMin) public onlyOwner {
-        MINIMUM_BET = newMin;
+        minimum_bet = newMin;
     }
 
     function __callback(bytes32 myid, string result) public {
         if (msg.sender != oraclize_cbAddress()) revert();
         uint8 matchId = oraclizeIds[myid];
+        bool firstVerification = firstStepVerified[matchId];
         // The sha3 hash of false, as in failed to get the finished match
         if (bytes(result).length == 0 || (keccak256(result) == keccak256("[null, null]"))) {
-            uint8 attempts = ++payoutAttempts[matchId];
             // If max number of attempts has been reached then return all bets
-            if (attempts >= MAX_NUM_PAYOUT_ATTEMPTS) {
+            if (++payoutAttempts[matchId] >= MAX_NUM_PAYOUT_ATTEMPTS) {
                 _returnAllBets(matchId);
                 emit MatchFailedPayoutRelease(matchId);
             } else {
-                string memory url = strConcat(
-                    "json(https://api.football-data.org/v1/fixtures/", 
-                    matches[matchId].fixtureId,
-                    ").fixture.result.[goalsHomeTeam,goalsAwayTeam]");
-                bytes32 oraclizeId = oraclize_query(PAYOUT_ATTEMPT_INTERVAL, "URL", url);
+                string memory url;
+                string memory querytype;
+                if (firstVerification) {
+                    url = strConcat(
+                        "json(https://api.football-data.org/v1/fixtures/", 
+                        matches[matchId].fixtureId,
+                        ").fixture.result.[goalsHomeTeam,goalsAwayTeam]");
+                    querytype = "URL";
+                } else {                
+                    url = strConcat(
+                        "[URL] json(https://soccer.sportmonks.com/api/v2.0/fixtures/",
+                        matches[matchId].secondaryFixtureId,
+                        "?api_token=${[decrypt] BB0vgU3qtWxzdYMGsvYdEjMPIFCMLjr/oeiWctE8n/coKjARSuQhGnc7z18FO2h1C06ZKpaZkSTIsG345adgUS/YTPkf7gwPXTjJlIAcv9DYDIXjrAXOWH+xAaLCjQkaF6Vy/JrhaLjzlEH7Eku8fL4lJetgbl/l0ONFIfLtUdGeahy+i6KKdlAouwdp}).data.scores[localteam_score,visitorteam_score]");
+                    querytype = "nested";
+                }
+                bytes32 oraclizeId = oraclize_query(PAYOUT_ATTEMPT_INTERVAL, querytype, url);
                 oraclizeIds[oraclizeId] = matchId;
-                emit MatchFailedAttemptedPayoutRelease(matchId, attempts);
+                emit MatchFailedAttemptedPayoutRelease(matchId);
             }
         } else {
+            payoutAttempts[matchId] = 0;
             // eg. result = [2, 4]
             strings.slice memory s = result.toSlice();
             s = s.beyond("[".toSlice());
             s = s.until("]".toSlice());
             strings.slice memory x = s.split(", ".toSlice());
-            uint homeScore = parseInt(x.toString());
-            uint awayScore = parseInt(s.toString());
+            uint homeScore = parseInt(s.toString()); 
+            uint awayScore = parseInt(x.toString());
             uint8 matchResult;
             if (homeScore > awayScore) {
                 matchResult = 1;
@@ -402,8 +379,31 @@ contract WorldCupBroker is Ownable, usingOraclize {
             } else {
                 matchResult = 3;
             }
-            _payoutWinners(matchId, matchResult);
-            emit MatchOver(matchId, matchResult);
+            if (firstVerification) {
+                url = strConcat(
+                    "[URL] json(https://soccer.sportmonks.com/api/v2.0/fixtures/",
+                    matches[matchId].secondaryFixtureId,
+                    "?api_token=${[decrypt] BB0vgU3qtWxzdYMGsvYdEjMPIFCMLjr/oeiWctE8n/coKjARSuQhGnc7z18FO2h1C06ZKpaZkSTIsG345adgUS/YTPkf7gwPXTjJlIAcv9DYDIXjrAXOWH+xAaLCjQkaF6Vy/JrhaLjzlEH7Eku8fL4lJetgbl/l0ONFIfLtUdGeahy+i6KKdlAouwdp}).data.scores[localteam_score,visitorteam_score]");
+                oraclizeId = oraclize_query("nested", url);
+                oraclizeIds[oraclizeId] = matchId;
+                pendingWinner[matchId] = matchResult;
+                firstStepVerified[matchId] = true;
+            } else {
+                if (!firstVerification && matches[matchId].inverted) {
+                    if (matchResult == 1) {
+                        matchResult = 2;
+                    } else if (matchResult == 2) {
+                        matchResult = 1;
+                    }
+                }
+                if (pendingWinner[matchId] == matchResult) {
+                    _payoutWinners(matchId, matchResult);
+                    emit MatchUpdated(matchId);
+                } else {
+                    _returnAllBets(matchId);
+                    emit MatchFailedPayoutRelease(matchId);
+                }
+            }
         }
     }
     
