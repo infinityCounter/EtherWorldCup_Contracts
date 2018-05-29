@@ -146,7 +146,7 @@ contract WorldCupBroker is Ownable, usingOraclize {
             "json(https://api.football-data.org/v1/fixtures/", 
             newMatch.fixtureId,
             ").fixture.result.[goalsHomeTeam,goalsAwayTeam]");
-        bytes32 oraclizeId = oraclize_query((_start + 3 hours), "URL", url);
+        bytes32 oraclizeId = oraclize_query((_start + (3 hours)), "URL", url);
         oraclizeIds[oraclizeId] = matchId;
         emit MatchCreated(matchId);
         return matchId;
