@@ -99,8 +99,8 @@ contract WorldCupBroker is Ownable, usingOraclize {
     uint public  commission_rate = 7;
     uint public  minimum_bet = 0.01 ether;
     uint private commissions = 0;
-    uint public  primaryGasLimit = 250000;
-    uint public  secondaryGasLimit = 325000;
+    uint public  primaryGasLimit = 225000;
+    uint public  secondaryGasLimit = 250000;
     
 
     Match[] matches;
@@ -122,7 +122,7 @@ contract WorldCupBroker is Ownable, usingOraclize {
 
     function addMatch(string _name, string _fixture, string _secondary, bool _invert, uint8 _teamA, uint8 _teamB, uint _start) public onlyOwner returns (uint8) {
         // Check that there's at least 15 minutes until the match starts
-        require(_teamA < 32 && _teamB < 32 && _teamA != _teamB && (_start - 1 minutes) >= now);
+        require(_teamA < 32 && _teamB < 32 && _teamA != _teamB && (_start - 15 minutes) >= now);
         Match memory newMatch = Match({
             locked: false, 
             cancelled: false, 
@@ -133,22 +133,19 @@ contract WorldCupBroker is Ownable, usingOraclize {
             secondaryFixtureId: _secondary,
             inverted: _invert,
             start: _start, 
-            closeBettingTime: _start - 1 minutes, 
+            closeBettingTime: _start - 2 minutes, // betting closes 2 minutes before a match starts
             totalTeamABets: 0, 
             totalTeamBBets: 0, 
             totalDrawBets: 0, 
             numBets: 0,
             name: _name
         });
-        // only ower can call this addMatch method so uint8 is fine
         uint8 matchId = uint8(matches.push(newMatch)) - 1;
-        // This query should return false if the match isn't finished yet, otherwise 
-        // there should be goal values set for both teams
         string memory url = strConcat(
             "[URL] json(https://soccer.sportmonks.com/api/v2.0/fixtures/",
             newMatch.secondaryFixtureId,
             "?api_token=${[decrypt] BH6lW+OXk8Uj46ESMgOzctlat1qH/zKYcFzjFZdRLBDqlu+Ww6JLEwrNc+05KoJCSNkSd5RmM24b1K1vhj0IE8YLIz8tzI5LLpUeojciWsSEkv9F/x0gf5TRrMEYBvif674IoGRptQXr8K22wBhauH0wkTlqthtRI0iMS1ift8b2ww2gkHhsr4SemSjI}).data.scores[localteam_score,visitorteam_score]");
-        bytes32 oraclizeId = oraclize_query((_start + (1 minutes)), "nested", url, primaryGasLimit);
+        bytes32 oraclizeId = oraclize_query((_start + (3 hours)), "nested", url, primaryGasLimit);
         oraclizeIds[oraclizeId] = matchId;
         emit MatchCreated(matchId);
         return matchId;
@@ -398,7 +395,7 @@ contract WorldCupBroker is Ownable, usingOraclize {
                     "json(https://api.football-data.org/v1/fixtures/", 
                     matches[matchId].fixtureId,
                     ").fixture.result.[goalsHomeTeam,goalsAwayTeam]");
-                oraclizeId = oraclize_query("URL", url, secondaryGasLimit);
+                oraclizeId = oraclize_query("nested", url, secondaryGasLimit);
                 oraclizeIds[oraclizeId] = matchId;
             } else {
                 if (matches[matchId].inverted) {
